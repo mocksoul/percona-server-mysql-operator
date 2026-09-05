@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/sjmudd/stopwatch"
@@ -167,13 +170,31 @@ func Bootstrap(ctx context.Context) error {
 		return nil
 	}
 
-	needClone, why, err := decideClone(ctx, primary, operatorPass, readTimeout, &recovery.Runner{DB: db.SQL()})
+	verdict, err := decideClone(ctx, primary, operatorPass, readTimeout, &recovery.Runner{DB: db.SQL()})
 	if err != nil {
 		return errors.Wrap(err, "decide on clone")
 	}
-	log.Printf("Clone required: %t -- %s", needClone, why)
+	log.Printf("Clone required: %t -- %s", verdict.clone, verdict.why)
 
-	if needClone {
+	if verdict.clone {
+		if verdict.errant != "" {
+			// These transactions exist nowhere else. The clone is about to
+			// wipe them; keep a copy someone can read later. A failed dump
+			// is logged, not fatal: the alternative is a replica that never
+			// comes back.
+			//
+			// The datadir is the right place: CLONE replaces tablespaces,
+			// binlogs and the schemas, not stray files (bootstrap.log and
+			// auto.cnf survive it), and it is the one volume that is
+			// certainly there and certainly big enough.
+			out := filepath.Join(mysql.DataMountPath, fmt.Sprintf("errant-%s-%s.sql", fqdn, time.Now().UTC().Format("20060102T150405Z")))
+			if err := saveErrant(ctx, db, out, verdict.errant); err != nil {
+				log.Printf("WARNING: could not save errant transactions %s: %v", verdict.errant, err)
+			} else {
+				log.Printf("Saved errant transactions %s to %s", verdict.errant, out)
+			}
+		}
+
 		if err := db.DisableSuperReadonly(ctx); err != nil {
 			return errors.Wrap(err, "disable super read only")
 		}
@@ -377,7 +398,7 @@ var newPrimaryRunner = func(ctx context.Context, params database.DBParams) (reco
 // of a dead primary is frozen at some point in the past, and cloning it
 // gains nothing over the data already here. So: keep whatever data there is
 // and let replication reconnect; clone only if there is no data at all.
-func decideClone(ctx context.Context, primary, operatorPass string, readTimeout uint32, local recovery.SQLRunner) (bool, string, error) {
+func decideClone(ctx context.Context, primary, operatorPass string, readTimeout uint32, local recovery.SQLRunner) (cloneVerdict, error) {
 	primaryRunner, closePrimary, err := newPrimaryRunner(ctx, database.DBParams{
 		User:               apiv1.UserOperator,
 		Pass:               operatorPass,
@@ -387,22 +408,122 @@ func decideClone(ctx context.Context, primary, operatorPass string, readTimeout 
 	if err != nil {
 		executed, gtidErr := local.GetGTIDExecuted(ctx)
 		if gtidErr != nil {
-			return false, "", errors.Wrap(gtidErr, "get local GTID_EXECUTED")
+			return cloneVerdict{}, errors.Wrap(gtidErr, "get local GTID_EXECUTED")
 		}
 		if executed == "" {
-			return true, fmt.Sprintf("primary %s unreachable (%v) and no local data", primary, err), nil
+			return cloneVerdict{clone: true, why: fmt.Sprintf("primary %s unreachable (%v) and no local data", primary, err)}, nil
 		}
-		return false, fmt.Sprintf("primary %s unreachable (%v); keeping local data, replication will reconnect", primary, err), nil
+		return cloneVerdict{why: fmt.Sprintf("primary %s unreachable (%v); keeping local data, replication will reconnect", primary, err)}, nil
 	}
 	defer closePrimary()
 
 	state, err := recovery.CheckReplicaState(ctx, primaryRunner, local)
 	if err != nil {
-		return false, "", errors.Wrap(err, "check replica state")
+		return cloneVerdict{}, errors.Wrap(err, "check replica state")
 	}
 
 	clone, why := cloneDecision(state)
-	return clone, fmt.Sprintf("%s: %s", state, why), nil
+	verdict := cloneVerdict{clone: clone, why: fmt.Sprintf("%s: %s", state, why)}
+
+	if state == innodbcluster.ReplicaGtidDiverged {
+		verdict.errant, err = errantGTIDs(ctx, primaryRunner, local)
+		if err != nil {
+			return cloneVerdict{}, errors.Wrap(err, "compute errant GTIDs")
+		}
+	}
+
+	return verdict, nil
+}
+
+// cloneVerdict is what decideClone concluded and why. errant is set only for
+// a diverged replica: the GTIDs it has and the primary does not.
+type cloneVerdict struct {
+	clone  bool
+	why    string
+	errant string
+}
+
+// errantGTIDs is GTID_SUBTRACT(local, primary), evaluated on the primary --
+// this replica may be read-only and the function is the same everywhere.
+func errantGTIDs(ctx context.Context, primary, local recovery.SQLRunner) (string, error) {
+	localExecuted, err := local.GetGTIDExecuted(ctx)
+	if err != nil {
+		return "", errors.Wrap(err, "local GTID_EXECUTED")
+	}
+	primaryExecuted, err := primary.GetGTIDExecuted(ctx)
+	if err != nil {
+		return "", errors.Wrap(err, "primary GTID_EXECUTED")
+	}
+	return primary.GTIDSubtract(ctx, localExecuted, primaryExecuted)
+}
+
+// saveErrant asks mysqld where its binlog index is and dumps gtids from it.
+func saveErrant(ctx context.Context, db *database.DB, out, gtids string) error {
+	var index string
+	if err := db.SQL().QueryRowContext(ctx, "SELECT @@log_bin_index").Scan(&index); err != nil {
+		return errors.Wrap(err, "get @@log_bin_index")
+	}
+	return dumpErrant(ctx, out, gtids, index)
+}
+
+// mysqlbinlogPath is where the mysql image ships the tool. Tests point it at
+// a stand-in.
+var mysqlbinlogPath = "mysqlbinlog"
+
+// dumpErrant writes the given GTIDs as SQL to out, from the binlog files
+// listed in index (binlog.index in the datadir). Bootstrap runs in the mysqld
+// container and sees the files directly; mysqld is up but idle at this
+// point, replication is stopped, so the files are complete. The output is
+// what a human applies by hand on the new primary after reading it, or
+// deletes.
+func dumpErrant(ctx context.Context, out, gtids, index string) error {
+	binlogs, err := readBinlogIndex(index)
+	if err != nil {
+		return err
+	}
+	if len(binlogs) == 0 {
+		return errors.Errorf("%s lists no binlogs", index)
+	}
+
+	f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return errors.Wrapf(err, "create %s", out)
+	}
+	defer f.Close()
+
+	args := append([]string{"--include-gtids=" + gtids, "--verbose"}, binlogs...)
+	cmd := exec.CommandContext(ctx, mysqlbinlogPath, args...)
+	cmd.Stdout = f
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return errors.Wrapf(err, "mysqlbinlog: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// readBinlogIndex returns the binlog paths from a binlog.index file. Entries
+// are relative to the index's directory unless absolute.
+func readBinlogIndex(index string) ([]string, error) {
+	data, err := os.ReadFile(index)
+	if err != nil {
+		return nil, errors.Wrapf(err, "read %s", index)
+	}
+
+	dir := filepath.Dir(index)
+	var out []string
+	for line := range strings.SplitSeq(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !filepath.IsAbs(line) {
+			line = filepath.Join(dir, line)
+		}
+		out = append(out, line)
+	}
+	return out, nil
 }
 
 // cloneDecision maps the GTID relation to the verdict. A replica whose SQL
