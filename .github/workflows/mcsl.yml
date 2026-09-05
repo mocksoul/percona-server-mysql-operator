@@ -1,0 +1,34 @@
+name: mcsl
+
+# Fork-side CI. Upstream's tests.yml runs on pull_request only, so a push to
+# mcsl/* would otherwise go untested. Same job as upstream, different trigger.
+on:
+  push:
+    branches:
+      - "mcsl/**"
+      - "feat/**"
+      - "fix/**"
+  pull_request:
+    branches:
+      - "mcsl/**"
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v7
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          # Latest 1.26.x, same as upstream. controller-gen walks ./... into
+          # .github/linters/ whose go.mod pins a newer patch than the root one.
+          go-version: "^1.26"
+      - name: Perform the test
+        run: make test
+      - name: Tree must stay clean after make test
+        # generate/manifests rewrite tracked files (kustomize image tags, deploy/*.yaml)
+        # from the branch name; on a release-pinned branch that is noise, not a change.
+        run: git diff --exit-code -- . ':!config/manager' ':!deploy'
