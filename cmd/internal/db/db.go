@@ -196,20 +196,37 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
+// SQL exposes the underlying connection for code that speaks database/sql
+// directly, such as the recovery decision.
+func (d *DB) SQL() *sql.DB {
+	return d.db
+}
+
+// CloneInProgress reports whether a CLONE INSTANCE is still running on this
+// server.
+//
+// performance_schema.clone_status is in memory and is not rewritten when a
+// clone dies with its session: a clone whose connection was interrupted
+// stays "In Progress" with ERROR_NO=1317 until mysqld restarts. Trusting
+// STATE alone makes a bootstrap wait on it forever. A row with an error is a
+// clone that is over, whatever STATE says.
 func (d *DB) CloneInProgress(ctx context.Context) (bool, error) {
-	rows, err := d.db.QueryContext(ctx, "SELECT STATE FROM clone_status")
+	rows, err := d.db.QueryContext(ctx, "SELECT STATE, ERROR_NO FROM clone_status")
 	if err != nil {
 		return false, errors.Wrap(err, "fetch clone status")
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var state string
-		if err := rows.Scan(&state); err != nil {
+		var (
+			state   string
+			errorNo int
+		)
+		if err := rows.Scan(&state, &errorNo); err != nil {
 			return false, errors.Wrap(err, "scan rows")
 		}
 
-		if state != cloneStateCompleted && state != cloneStateFailed {
+		if state != cloneStateCompleted && state != cloneStateFailed && errorNo == 0 {
 			return true, nil
 		}
 	}

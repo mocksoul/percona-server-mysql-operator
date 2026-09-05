@@ -1,4 +1,4 @@
-package gr
+package recovery
 
 import (
 	"context"
@@ -26,39 +26,39 @@ func newMockSQLRunner() *mockSQLRunner {
 	}
 }
 
-func (m *mockSQLRunner) getGTIDExecuted(ctx context.Context) (string, error) {
+func (m *mockSQLRunner) GetGTIDExecuted(ctx context.Context) (string, error) {
 	return m.gtidExecuted, nil
 }
 
-func (m *mockSQLRunner) getGTIDPurged(ctx context.Context) (string, error) {
+func (m *mockSQLRunner) GetGTIDPurged(ctx context.Context) (string, error) {
 	return m.gtidPurged, nil
 }
 
-func (m *mockSQLRunner) gtidSubtract(ctx context.Context, a, b string) (string, error) {
+func (m *mockSQLRunner) GTIDSubtract(ctx context.Context, a, b string) (string, error) {
 	v, ok := m.subtract[[2]string{a, b}]
 	if !ok {
-		return "", errors.Errorf("unexpected gtidSubtract(%q, %q)", a, b)
+		return "", errors.Errorf("unexpected GTIDSubtract(%q, %q)", a, b)
 	}
 	return v, nil
 }
 
-func (m *mockSQLRunner) gtidSubtractIntersection(ctx context.Context, a, b string) (string, error) {
+func (m *mockSQLRunner) GTIDSubtractIntersection(ctx context.Context, a, b string) (string, error) {
 	v, ok := m.intersect[[2]string{a, b}]
 	if !ok {
-		return "", errors.Errorf("unexpected gtidSubtractIntersection(%q, %q)", a, b)
+		return "", errors.Errorf("unexpected GTIDSubtractIntersection(%q, %q)", a, b)
 	}
 	return v, nil
 }
 
-func (m *mockSQLRunner) isPurgedSubsetOfExecuted(ctx context.Context, purged, executed string) (bool, error) {
+func (m *mockSQLRunner) IsPurgedSubsetOfExecuted(ctx context.Context, purged, executed string) (bool, error) {
 	v, ok := m.isSubset[[2]string{purged, executed}]
 	if !ok {
-		return false, errors.Errorf("unexpected isPurgedSubsetOfExecuted(%q, %q)", purged, executed)
+		return false, errors.Errorf("unexpected IsPurgedSubsetOfExecuted(%q, %q)", purged, executed)
 	}
 	return v, nil
 }
 
-func (m *mockSQLRunner) getCloneThreshold(ctx context.Context) (uint64, error) {
+func (m *mockSQLRunner) GetCloneThreshold(ctx context.Context) (uint64, error) {
 	return m.cloneThreshold, nil
 }
 
@@ -82,7 +82,7 @@ func TestCompareGTIDs_Equal(t *testing.T) {
 	mock.setGTIDSubtractResponse("a:1-5", "b:1-3", "")
 	mock.setGTIDSubtractResponse("b:1-3", "a:1-5", "")
 
-	result, err := compareGTIDs(ctx, mock, "a:1-5", "b:1-3")
+	result, err := CompareGTIDs(ctx, mock, "a:1-5", "b:1-3")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestCompareGTIDs_AContainsB(t *testing.T) {
 	mock.setGTIDSubtractResponse("a:1-10", "a:1-5", "a:6-10")
 	mock.setGTIDSubtractResponse("a:1-5", "a:1-10", "")
 
-	result, err := compareGTIDs(ctx, mock, "a:1-10", "a:1-5")
+	result, err := CompareGTIDs(ctx, mock, "a:1-10", "a:1-5")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestCompareGTIDs_BContainsA(t *testing.T) {
 	mock.setGTIDSubtractResponse("a:1-5", "a:1-10", "")
 	mock.setGTIDSubtractResponse("a:1-10", "a:1-5", "a:6-10")
 
-	result, err := compareGTIDs(ctx, mock, "a:1-5", "a:1-10")
+	result, err := CompareGTIDs(ctx, mock, "a:1-5", "a:1-10")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestCompareGTIDs_Disjoint(t *testing.T) {
 	// the intersection calculation: a - (a - b) should be empty for disjoint
 	mock.setGTIDSubtractIntersectionResponse("a:1-5", "b:1-5", "")
 
-	result, err := compareGTIDs(ctx, mock, "a:1-5", "b:1-5")
+	result, err := CompareGTIDs(ctx, mock, "a:1-5", "b:1-5")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestCompareGTIDs_Intersects(t *testing.T) {
 	// intersection calculation: a - (a - b) should be non-empty
 	mock.setGTIDSubtractIntersectionResponse("a:1-10", "a:6-15", "a:6-10")
 
-	result, err := compareGTIDs(ctx, mock, "a:1-10", "a:6-15")
+	result, err := CompareGTIDs(ctx, mock, "a:1-10", "a:6-15")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestCompareGTIDs_BothEmpty(t *testing.T) {
 	ctx := context.Background()
 	mock := newMockSQLRunner()
 
-	result, err := compareGTIDs(ctx, mock, "", "")
+	result, err := CompareGTIDs(ctx, mock, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestCompareGTIDs_AEmpty(t *testing.T) {
 	ctx := context.Background()
 	mock := newMockSQLRunner()
 
-	result, err := compareGTIDs(ctx, mock, "", "b:1-5")
+	result, err := CompareGTIDs(ctx, mock, "", "b:1-5")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestCompareGTIDs_BEmpty(t *testing.T) {
 	ctx := context.Background()
 	mock := newMockSQLRunner()
 
-	result, err := compareGTIDs(ctx, mock, "a:1-5", "")
+	result, err := CompareGTIDs(ctx, mock, "a:1-5", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestCheckReplicaState_New(t *testing.T) {
 	primary := newMockSQLRunnerWithGTIDs("a:1-10", "")
 	replica := newMockSQLRunnerWithGTIDs("", "")
 
-	result, err := checkReplicaState(ctx, primary, replica)
+	result, err := CheckReplicaState(ctx, primary, replica)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -229,11 +229,11 @@ func TestCheckReplicaState_Identical(t *testing.T) {
 	primary := newMockSQLRunnerWithGTIDs("a:1-10", "")
 	replica := newMockSQLRunnerWithGTIDs("a:1-10", "")
 
-	// mock the compareGTIDs calls - both subtractions return empty
+	// mock the CompareGTIDs calls - both subtractions return empty
 	primary.setGTIDSubtractResponse("a:1-10", "a:1-10", "")
 	primary.setGTIDSubtractResponse("a:1-10", "a:1-10", "")
 
-	result, err := checkReplicaState(ctx, primary, replica)
+	result, err := CheckReplicaState(ctx, primary, replica)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestCheckReplicaState_Recoverable_NoPurged(t *testing.T) {
 	primary.setGTIDSubtractResponse("a:1-10", "a:1-5", "a:6-10")
 	primary.setGTIDSubtractResponse("a:1-5", "a:1-10", "")
 
-	result, err := checkReplicaState(ctx, primary, replica)
+	result, err := CheckReplicaState(ctx, primary, replica)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestCheckReplicaState_Recoverable_WithPurgedButOK(t *testing.T) {
 
 	primary.setIsPurgedSubsetResponse("a:1-3", "a:1-5", true)
 
-	result, err := checkReplicaState(ctx, primary, replica)
+	result, err := CheckReplicaState(ctx, primary, replica)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestCheckReplicaState_Irrecoverable(t *testing.T) {
 
 	primary.setIsPurgedSubsetResponse("a:1-8", "a:1-5", false)
 
-	result, err := checkReplicaState(ctx, primary, replica)
+	result, err := CheckReplicaState(ctx, primary, replica)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestCheckReplicaState_Diverged_Intersects(t *testing.T) {
 	primary.setGTIDSubtractResponse("a:5-15", "a:1-10", "a:11-15")
 	primary.setGTIDSubtractIntersectionResponse("a:1-10", "a:5-15", "a:5-10")
 
-	result, err := checkReplicaState(ctx, primary, replica)
+	result, err := CheckReplicaState(ctx, primary, replica)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestCheckReplicaState_Diverged_Disjoint(t *testing.T) {
 	primary.setGTIDSubtractResponse("b:1-5", "a:1-5", "b:1-5")
 	primary.setGTIDSubtractIntersectionResponse("a:1-5", "b:1-5", "")
 
-	result, err := checkReplicaState(ctx, primary, replica)
+	result, err := CheckReplicaState(ctx, primary, replica)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -347,12 +347,55 @@ func TestCheckReplicaState_Diverged_Contained(t *testing.T) {
 	primary.setGTIDSubtractResponse("a:1-5", "a:1-10", "")
 	primary.setGTIDSubtractResponse("a:1-10", "a:1-5", "a:6-10")
 
-	result, err := checkReplicaState(ctx, primary, replica)
+	result, err := CheckReplicaState(ctx, primary, replica)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result != innodbcluster.ReplicaGtidDiverged {
 		t.Errorf("expected ReplicaGtidDiverged, got %v", result)
+	}
+}
+
+// A primary that comes back after orchestrator failed over to a replica. Its
+// last transactions (a:101-103) reached nobody before it went down; the new
+// primary has moved on with its own UUID (b:...). Neither set contains the
+// other. The old primary cannot rejoin with a:101-103 -- there is no history
+// in which both they and b:1-50 happened -- so it must be cloned.
+func TestCheckReplicaState_OldPrimaryAfterFailover(t *testing.T) {
+	ctx := context.Background()
+	newPrimary := newMockSQLRunnerWithGTIDs("a:1-100,b:1-50", "")
+	oldPrimary := newMockSQLRunnerWithGTIDs("a:1-103", "")
+
+	newPrimary.setGTIDSubtractResponse("a:1-100,b:1-50", "a:1-103", "b:1-50")
+	newPrimary.setGTIDSubtractResponse("a:1-103", "a:1-100,b:1-50", "a:101-103")
+	newPrimary.setGTIDSubtractIntersectionResponse("a:1-100,b:1-50", "a:1-103", "a:1-100")
+
+	result, err := CheckReplicaState(ctx, newPrimary, oldPrimary)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != innodbcluster.ReplicaGtidDiverged {
+		t.Errorf("expected ReplicaGtidDiverged, got %v", result)
+	}
+}
+
+// The same old primary, but it went down cleanly: everything it committed
+// had reached the replica that got promoted. It is simply behind now and
+// replication brings it up to date; its data stays.
+func TestCheckReplicaState_OldPrimaryAfterCleanFailover(t *testing.T) {
+	ctx := context.Background()
+	newPrimary := newMockSQLRunnerWithGTIDs("a:1-100,b:1-50", "")
+	oldPrimary := newMockSQLRunnerWithGTIDs("a:1-100", "")
+
+	newPrimary.setGTIDSubtractResponse("a:1-100,b:1-50", "a:1-100", "b:1-50")
+	newPrimary.setGTIDSubtractResponse("a:1-100", "a:1-100,b:1-50", "")
+
+	result, err := CheckReplicaState(ctx, newPrimary, oldPrimary)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != innodbcluster.ReplicaGtidRecoverable {
+		t.Errorf("expected ReplicaGtidRecoverable, got %v", result)
 	}
 }
 
@@ -441,12 +484,12 @@ func TestCloneThresholdExceeded(t *testing.T) {
 				primary.setGTIDSubtractResponse(tt.primaryExecuted, tt.replicaExecuted, tt.missing)
 			}
 
-			got, err := cloneThresholdExceeded(ctx, primary, replica)
+			got, err := CloneThresholdExceeded(ctx, primary, replica)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if got != tt.want {
-				t.Errorf("cloneThresholdExceeded() = %v, want %v", got, tt.want)
+				t.Errorf("CloneThresholdExceeded() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -467,12 +510,12 @@ func TestCountGTIDs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := countGTIDs(tt.set)
+			got, err := CountGTIDs(tt.set)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if got != tt.want {
-				t.Errorf("countGTIDs(%q) = %d, want %d", tt.set, got, tt.want)
+				t.Errorf("CountGTIDs(%q) = %d, want %d", tt.set, got, tt.want)
 			}
 		})
 	}
