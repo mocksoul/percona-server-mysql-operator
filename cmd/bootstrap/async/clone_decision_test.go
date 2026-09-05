@@ -133,6 +133,7 @@ func TestDecideClone(t *testing.T) {
 		connectErr error
 		local      *gtidServer
 		wantClone  bool
+		wantErrant string
 	}{
 		// The everyday restart: SIGABRT, OOM, node drain. The replica has
 		// its data, it is a little behind. Upstream reclones here on every
@@ -173,10 +174,11 @@ func TestDecideClone(t *testing.T) {
 		{
 			// The old primary after a failover, with writes nobody else
 			// got. The new primary (b) has moved on.
-			name:      "demoted primary with errant transactions",
-			primary:   &gtidServer{executed: "a:1-1000,b:1-50"},
-			local:     &gtidServer{executed: "a:1-1003"},
-			wantClone: true,
+			name:       "demoted primary with errant transactions",
+			primary:    &gtidServer{executed: "a:1-1000,b:1-50"},
+			local:      &gtidServer{executed: "a:1-1003"},
+			wantClone:  true,
+			wantErrant: "a:1001-1003",
 		},
 		{
 			// The old primary after a clean failover: everything it wrote
@@ -212,10 +214,11 @@ func TestDecideClone(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			withPrimary(t, tt.primary, tt.connectErr)
 
-			clone, why, err := decideClone(t.Context(), "primary", "pass", 0, tt.local)
+			verdict, err := decideClone(t.Context(), "primary", "pass", 0, tt.local)
 			require.NoError(t, err)
-			assert.Equal(t, tt.wantClone, clone, why)
-			assert.NotEmpty(t, why)
+			assert.Equal(t, tt.wantClone, verdict.clone, verdict.why)
+			assert.NotEmpty(t, verdict.why)
+			assert.Equal(t, tt.wantErrant, verdict.errant, "errant GTIDs are reported for a diverged replica and nothing else")
 		})
 	}
 }
@@ -271,4 +274,56 @@ func TestCloneLock(t *testing.T) {
 	require.NoError(t, deleteCloneLock(lock))
 	_, err = os.Stat(lock)
 	assert.True(t, os.IsNotExist(err))
+}
+
+// dumpErrant hands mysqlbinlog the GTID filter and every binlog the index
+// lists, in order, and keeps whatever it prints. The stand-in echoes its
+// arguments so the test can read the exact invocation off the output file.
+func TestDumpErrant(t *testing.T) {
+	dir := t.TempDir()
+
+	fake := filepath.Join(dir, "mysqlbinlog")
+	require.NoError(t, os.WriteFile(fake, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0o755))
+	orig := mysqlbinlogPath
+	mysqlbinlogPath = fake
+	t.Cleanup(func() { mysqlbinlogPath = orig })
+
+	datadir := filepath.Join(dir, "data")
+	require.NoError(t, os.Mkdir(datadir, 0o755))
+	index := filepath.Join(datadir, "binlog.index")
+	require.NoError(t, os.WriteFile(index, []byte("./binlog.000001\n./binlog.000002\n/abs/binlog.000003\n\n"), 0o644))
+
+	out := filepath.Join(dir, "errant.sql")
+	require.NoError(t, dumpErrant(t.Context(), out, "a:1001-1003", index))
+
+	got, err := os.ReadFile(out)
+	require.NoError(t, err)
+	assert.Equal(t, strings.Join([]string{
+		"--include-gtids=a:1001-1003",
+		"--verbose",
+		filepath.Join(datadir, "binlog.000001"),
+		filepath.Join(datadir, "binlog.000002"),
+		"/abs/binlog.000003",
+	}, "\n")+"\n", string(got))
+
+	info, err := os.Stat(out)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "the dump holds row data; owner-only")
+
+	// Never overwrite an earlier dump: a second diverged restart must not
+	// destroy what the first one saved.
+	assert.Error(t, dumpErrant(t.Context(), out, "a:1", index))
+
+	// mysqlbinlog failing is reported with its stderr, so the log says why.
+	require.NoError(t, os.WriteFile(fake, []byte("#!/bin/sh\necho 'ERROR: bad magic' >&2\nexit 1\n"), 0o755))
+	err = dumpErrant(t.Context(), filepath.Join(dir, "second.sql"), "a:1", index)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bad magic")
+
+	// An index with nothing in it means there is nothing to dump from, which
+	// is an error worth seeing rather than an empty file that looks like
+	// "no errant rows".
+	empty := filepath.Join(datadir, "empty.index")
+	require.NoError(t, os.WriteFile(empty, []byte("\n"), 0o644))
+	assert.Error(t, dumpErrant(t.Context(), filepath.Join(dir, "third.sql"), "a:1", empty))
 }
