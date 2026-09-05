@@ -44,9 +44,19 @@ func Bootstrap(ctx context.Context) error {
 	}
 	log.Printf("FQDN: %s", fqdn)
 
-	primary, replicas, err := getTopology(ctx, fqdn, peers)
+	operatorPass, err := utils.GetSecret(apiv1.UserOperator)
 	if err != nil {
-		return errors.Wrap(err, "select donor")
+		return errors.Wrapf(err, "get %s password", apiv1.UserOperator)
+	}
+
+	readTimeout, err := utils.GetReadTimeout()
+	if err != nil {
+		return errors.Wrap(err, "get read timeout")
+	}
+
+	primary, replicas, err := getTopology(ctx, fqdn, peers, operatorPass, readTimeout)
+	if err != nil {
+		return errors.Wrap(err, "get topology")
 	}
 	log.Printf("Primary: %s Replicas: %v", primary, replicas)
 
@@ -74,21 +84,12 @@ func Bootstrap(ctx context.Context) error {
 	log.Printf("Donor: %s", donor)
 
 	log.Printf("Opening connection to %s", podIp)
-	operatorPass, err := utils.GetSecret(apiv1.UserOperator)
-	if err != nil {
-		return errors.Wrapf(err, "get %s password", apiv1.UserOperator)
-	}
-
 	params := database.DBParams{
-		User: apiv1.UserOperator,
-		Pass: operatorPass,
-		Host: podIp,
+		User:               apiv1.UserOperator,
+		Pass:               operatorPass,
+		Host:               podIp,
+		ReadTimeoutSeconds: readTimeout,
 	}
-	readTimeout, err := utils.GetReadTimeout()
-	if err != nil {
-		return errors.Wrap(err, "get read timeout")
-	}
-	params.ReadTimeoutSeconds = readTimeout
 
 	cloneTimeout, err := utils.GetCloneTimeout()
 	if err != nil {
@@ -219,41 +220,55 @@ func Bootstrap(ctx context.Context) error {
 	return nil
 }
 
-func getTopology(ctx context.Context, fqdn string, peers sets.Set[string]) (string, []string, error) {
+// peerDB is what getTopology needs from a peer. *database.DB satisfies it;
+// tests substitute their own through newPeerDB.
+type peerDB interface {
+	ReplicationStatus(ctx context.Context) (mysqldb.ReplicationStatus, string, error)
+	ReportHost(ctx context.Context) (string, error)
+	Close() error
+}
+
+var newPeerDB = func(ctx context.Context, params database.DBParams) (peerDB, error) {
+	return database.NewDatabase(ctx, params)
+}
+
+// getTopology asks every peer who it replicates from and returns the primary
+// plus the remaining replicas.
+//
+// A peer that cannot be reached or answered is skipped, not fatal: the pod
+// being bootstrapped is itself one of the peers, and so is any other pod
+// that is mid-restart. Failing the whole bootstrap on one dead peer means
+// two unhealthy pods keep each other down forever -- each one's startup
+// probe dies on the other. The topology is derived from whoever answers.
+func getTopology(ctx context.Context, fqdn string, peers sets.Set[string], operatorPass string, readTimeout uint32) (string, []string, error) {
 	replicas := sets.New[string]()
 	primary := ""
 
-	operatorPass, err := utils.GetSecret(apiv1.UserOperator)
-	if err != nil {
-		return "", nil, errors.Wrapf(err, "get %s password", apiv1.UserOperator)
-	}
-
 	for _, peer := range sets.List(peers) {
 		params := database.DBParams{
-			User: apiv1.UserOperator,
-			Pass: operatorPass,
-			Host: peer,
+			User:               apiv1.UserOperator,
+			Pass:               operatorPass,
+			Host:               peer,
+			ReadTimeoutSeconds: readTimeout,
 		}
-		readTimeout, err := utils.GetReadTimeout()
-		if err != nil {
-			return "", nil, errors.Wrap(err, "get read timeout")
-		}
-		params.ReadTimeoutSeconds = readTimeout
 
-		db, err := database.NewDatabase(ctx, params)
+		db, err := newPeerDB(ctx, params)
 		if err != nil {
-			return "", nil, errors.Wrapf(err, "connect to %s", peer)
+			log.Printf("Skipping peer %s: connect: %v", peer, err)
+			continue
 		}
 		defer db.Close()
 
 		status, source, err := db.ReplicationStatus(ctx)
 		if err != nil {
-			return "", nil, errors.Wrap(err, "check replication status")
+			log.Printf("Skipping peer %s: replication status: %v", peer, err)
+			continue
 		}
 
 		replicaHost, err := db.ReportHost(ctx)
 		if err != nil {
-			return "", nil, errors.Wrap(err, "get report_host")
+			log.Printf("Skipping peer %s: report_host: %v", peer, err)
+			continue
 		}
 		if replicaHost == "" {
 			continue
@@ -263,6 +278,15 @@ func getTopology(ctx context.Context, fqdn string, peers sets.Set[string]) (stri
 		if status == mysqldb.ReplicationStatusActive {
 			primary = source
 		}
+	}
+
+	// The bootstrapped pod is one of the peers and its own mysqld is up by
+	// now (the startup probe runs this), so an empty set means not even that
+	// worked. It must be an error, not an empty topology: no primary means
+	// no donor, and the caller takes "no donor" as "we're on our own" --
+	// replication reset, writable, outside the cluster.
+	if replicas.Len() == 0 {
+		return "", nil, errors.Errorf("none of the peers %v answered", sets.List(peers))
 	}
 
 	if primary == "" && peers.Len() == 1 {
