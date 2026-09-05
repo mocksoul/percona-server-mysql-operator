@@ -167,27 +167,55 @@ add_encryption_options() {
 	sed -i "/\[mysqld\]/a encrypt_tmp_files=ON" $CFG
 }
 
-create_default_cnf() {
-	# hostname -I can list a node-local RFC 3927 link-local address (the
-	# full range is 169.254.0.0/16), assigned by some CNI plugins - such as
-	# the AWS VPC CNI's IPv6-cluster egress-NAT helper, which uses
-	# 169.254.172.0/22 specifically - for outbound-only traffic, ahead of
-	# the pod's real routable address. That address is not reachable from
-	# other pods, so using it here breaks admin-address for anything that
-	# needs to reach it (e.g. haproxy's backend healthchecks). Excludes the
-	# whole 169.254.0.0/16 range by default (overridable via
-	# POD_IP_EXCLUDE_REGEX, a grep -E pattern, if a narrower exclusion is
-	# ever needed) since other CNIs may assign non-routable addresses
-	# anywhere in that range, not just AWS's specific /22. Falls back to
-	# the original unfiltered first address if every candidate gets
-	# excluded, so a host with nothing but link-local addresses doesn't
-	# leave POD_IP empty - and the `|| true` keeps that fallback from
-	# being skipped by `set -eo pipefail` above when grep finds no match.
-	POD_IP_EXCLUDE_REGEX="${POD_IP_EXCLUDE_REGEX:-^169\.254\.}"
-	POD_IP=$(hostname -I | tr ' ' '\n' | grep -v -E "$POD_IP_EXCLUDE_REGEX" | head -n1 || true)
-	if [ -z "$POD_IP" ]; then
-		POD_IP=$(hostname -I | awk '{print $1}')
+# The address mysqld binds admin-address to, i.e. the one other pods use to
+# reach the admin port: clone donors, haproxy healthchecks, mysqlsh.
+#
+# `hostname -I` lists every address the pod has, in interface order, and the
+# first one is not always routable from other pods:
+#
+#   - some CNI plugins put a link-local 169.254.0.0/16 address first (the AWS
+#     VPC CNI's IPv6-cluster egress-NAT helper uses 169.254.172.0/22);
+#   - a pod with several networks (Multus, a second CNI) can have its
+#     cluster-routable address on any interface, not the first.
+#
+# POD_IP_EXCLUDE_REGEX drops addresses that must never be used (grep -E,
+# default: the whole link-local range). POD_IP_INCLUDE_REGEX, when set, then
+# picks the first address that matches it; that is how a multi-network pod
+# says which of its networks carries cluster traffic. Addresses are matched
+# one per line.
+#
+# Falls back to the unfiltered first address when nothing survives, so a host
+# with nothing but excluded addresses does not leave admin-address empty. The
+# `|| true` keeps `set -eo pipefail` from turning a no-match grep into an exit.
+#
+# Fork-only shape: upstream main keeps this in build/lib/util.sh, which the
+# release this fork runs does not have yet.
+pod_ip() {
+	local exclude="${POD_IP_EXCLUDE_REGEX:-^169\.254\.}"
+	local candidates ip
+
+	candidates=$(hostname -I | tr ' ' '\n' | grep -v -E "${exclude}" || true)
+
+	if [ -n "${POD_IP_INCLUDE_REGEX}" ]; then
+		ip=$(echo "${candidates}" | grep -E "${POD_IP_INCLUDE_REGEX}" | head -n1 || true)
+		if [ -z "${ip}" ]; then
+			echo "no address matches POD_IP_INCLUDE_REGEX='${POD_IP_INCLUDE_REGEX}', ignoring it" >&2
+		fi
 	fi
+
+	if [ -z "${ip}" ]; then
+		ip=$(echo "${candidates}" | head -n1)
+	fi
+
+	if [ -z "${ip}" ]; then
+		ip=$(hostname -I | awk '{print $1}')
+	fi
+
+	echo "${ip}"
+}
+
+create_default_cnf() {
+	POD_IP=$(pod_ip)
 
 	if [[ ${HOSTNAME} =~ "-xb-" ]]; then
 		FQDN=${HOSTNAME}
@@ -250,7 +278,7 @@ create_default_cnf() {
 }
 
 load_group_replication_plugin() {
-	POD_IP=$(hostname -I | awk '{print $1}')
+	POD_IP=$(pod_ip)
 
 	sed -i "/\[mysqld\]/a plugin_load_add=group_replication.so" $CFG
 	sed -i "/\[mysqld\]/a group_replication_exit_state_action=ABORT_SERVER" $CFG
