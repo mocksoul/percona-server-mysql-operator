@@ -171,3 +171,26 @@ func TestDBParams_DSN(t *testing.T) {
 	assert.Contains(t, dsn, "timeout=10s")
 	assert.Contains(t, dsn, "writeTimeout=31s")
 }
+
+func TestDBParams_DSN_IPv6Host(t *testing.T) {
+	// A bare IPv6 host has to be bracketed in the address or the driver reads
+	// its last hextet as the port ("fcff::1:3306" -> host "fcff::1", port "3306"
+	// vs host "fcff:", port "1:3306"). Every host a bootstrap sees in an IPv6
+	// cluster -- pod IP, peer, donor -- comes in bare.
+	tests := []struct {
+		name string
+		host string
+		want string
+	}{
+		{"ipv6", "fcff:0:675:1::1b70", "tcp([fcff:0:675:1::1b70]:3306)"},
+		{"ipv6 loopback", "::1", "tcp([::1]:3306)"},
+		{"ipv4", "10.233.77.173", "tcp(10.233.77.173:3306)"},
+		{"hostname", "ps-mysql-0.ps-mysql.ns", "tcp(ps-mysql-0.ps-mysql.ns:3306)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := DBParams{User: apiv1.UserOperator, Pass: "x", Host: tt.host, Port: 3306}
+			assert.Contains(t, params.DSN(), tt.want)
+		})
+	}
+}
