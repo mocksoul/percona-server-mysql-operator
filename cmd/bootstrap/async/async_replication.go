@@ -2,6 +2,7 @@ package async
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -11,9 +12,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	apiv1 "github.com/percona/percona-server-mysql-operator/api/v1"
+	"github.com/percona/percona-server-mysql-operator/cmd/bootstrap/recovery"
 	"github.com/percona/percona-server-mysql-operator/cmd/bootstrap/utils"
 	database "github.com/percona/percona-server-mysql-operator/cmd/internal/db"
 	mysqldb "github.com/percona/percona-server-mysql-operator/pkg/db"
+	"github.com/percona/percona-server-mysql-operator/pkg/innodbcluster"
 	"github.com/percona/percona-server-mysql-operator/pkg/mysql"
 )
 
@@ -142,25 +145,34 @@ func Bootstrap(ctx context.Context) error {
 		return nil
 	}
 
+	// clone.lock marks "a clone just finished, mysqld is restarting". The
+	// heartbeat sidecar waits for it to go away before it starts. It is made
+	// right before the restart and removed on the next pass, before anything
+	// else can return early -- a lock left behind keeps heartbeat down, and
+	// with it the lag orchestrator reads when it decides whom to promote.
 	cloneLock := filepath.Join(mysql.DataMountPath, "clone.lock")
-	requireClone, err := isCloneRequired(cloneLock)
-	if err != nil {
-		return errors.Wrap(err, "check if clone is required")
+	if err := deleteCloneLock(cloneLock); err != nil {
+		return errors.Wrap(err, "delete clone lock")
 	}
 
-	log.Printf("Clone required: %t", requireClone)
-	if requireClone {
-		log.Println("Checking if a clone in progress")
-		inProgress, err := db.CloneInProgress(ctx)
-		if err != nil {
-			return errors.Wrap(err, "check if a clone in progress")
-		}
+	log.Println("Checking if a clone in progress")
+	inProgress, err := db.CloneInProgress(ctx)
+	if err != nil {
+		return errors.Wrap(err, "check if a clone in progress")
+	}
 
-		log.Printf("Clone in progress: %t", inProgress)
-		if inProgress {
-			return nil
-		}
+	log.Printf("Clone in progress: %t", inProgress)
+	if inProgress {
+		return nil
+	}
 
+	needClone, why, err := decideClone(ctx, primary, operatorPass, readTimeout, &recovery.Runner{DB: db.SQL()})
+	if err != nil {
+		return errors.Wrap(err, "decide on clone")
+	}
+	log.Printf("Clone required: %t -- %s", needClone, why)
+
+	if needClone {
 		if err := db.DisableSuperReadonly(ctx); err != nil {
 			return errors.Wrap(err, "disable super read only")
 		}
@@ -182,12 +194,6 @@ func Bootstrap(ctx context.Context) error {
 
 		// We return with 1 to restart container
 		os.Exit(1)
-	}
-
-	if !requireClone {
-		if err := deleteCloneLock(cloneLock); err != nil {
-			return errors.Wrap(err, "delete clone lock")
-		}
 	}
 
 	rStatus, _, err := db.ReplicationStatus(ctx)
@@ -325,16 +331,75 @@ func selectDonor(ctx context.Context, fqdn, primary string, replicas []string) (
 	return donor, nil
 }
 
-func isCloneRequired(file string) (bool, error) {
-	_, err := os.Stat(file)
+// newPrimaryRunner opens the primary for GTID arithmetic. Tests replace it.
+var newPrimaryRunner = func(ctx context.Context, params database.DBParams) (recovery.SQLRunner, func(), error) {
+	primaryDB, err := database.NewDatabase(ctx, params)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return true, nil
+		return nil, nil, err
+	}
+	return &recovery.Runner{DB: primaryDB.SQL()}, func() { primaryDB.Close() }, nil
+}
+
+// decideClone answers "wipe and clone, or keep the data and replicate" for
+// this replica, with the reason for the log.
+//
+// Only the data decides. Whether replication threads are running, whether a
+// lock file exists, whether this is the first start -- none of that says
+// anything about what is on disk. The data is compared with the primary's by
+// GTID set (see recovery.CheckReplicaState).
+//
+// When the primary cannot be reached there is nothing to compare with, and
+// nothing to clone from either: a clone is served by a replica, but a replica
+// of a dead primary is frozen at some point in the past, and cloning it
+// gains nothing over the data already here. So: keep whatever data there is
+// and let replication reconnect; clone only if there is no data at all.
+func decideClone(ctx context.Context, primary, operatorPass string, readTimeout uint32, local recovery.SQLRunner) (bool, string, error) {
+	primaryRunner, closePrimary, err := newPrimaryRunner(ctx, database.DBParams{
+		User:               apiv1.UserOperator,
+		Pass:               operatorPass,
+		Host:               primary,
+		ReadTimeoutSeconds: readTimeout,
+	})
+	if err != nil {
+		executed, gtidErr := local.GetGTIDExecuted(ctx)
+		if gtidErr != nil {
+			return false, "", errors.Wrap(gtidErr, "get local GTID_EXECUTED")
 		}
-		return false, errors.Wrapf(err, "stat %s", file)
+		if executed == "" {
+			return true, fmt.Sprintf("primary %s unreachable (%v) and no local data", primary, err), nil
+		}
+		return false, fmt.Sprintf("primary %s unreachable (%v); keeping local data, replication will reconnect", primary, err), nil
+	}
+	defer closePrimary()
+
+	state, err := recovery.CheckReplicaState(ctx, primaryRunner, local)
+	if err != nil {
+		return false, "", errors.Wrap(err, "check replica state")
 	}
 
-	return false, nil
+	clone, why := cloneDecision(state)
+	return clone, fmt.Sprintf("%s: %s", state, why), nil
+}
+
+// cloneDecision maps the GTID relation to the verdict. A replica whose SQL
+// thread died still has its data and needs replication restarted, not a
+// wipe; a replica that was primary until a failover has transactions nobody
+// else has and cannot rejoin with them.
+func cloneDecision(state innodbcluster.ReplicaGtidState) (bool, string) {
+	switch state {
+	case innodbcluster.ReplicaGtidIdentical:
+		return false, "up to date with the primary"
+	case innodbcluster.ReplicaGtidRecoverable:
+		return false, "behind the primary, it still has the binlogs we need"
+	case innodbcluster.ReplicaGtidNew:
+		return true, "no data, the primary has all of it"
+	case innodbcluster.ReplicaGtidIrrecoverable:
+		return true, "behind the primary and it has purged the binlogs in between"
+	case innodbcluster.ReplicaGtidDiverged:
+		return true, "we have transactions the primary does not; they cannot be kept"
+	default:
+		return true, fmt.Sprintf("unknown state %q, cloning to be safe", state)
+	}
 }
 
 func createCloneLock(file string) error {
@@ -342,7 +407,12 @@ func createCloneLock(file string) error {
 	return errors.Wrapf(err, "create %s", file)
 }
 
+// deleteCloneLock removes the lock if present; a missing lock is the usual
+// case, not an error.
 func deleteCloneLock(file string) error {
 	err := os.Remove(file)
+	if err != nil && os.IsNotExist(err) {
+		return nil
+	}
 	return errors.Wrapf(err, "remove %s", file)
 }

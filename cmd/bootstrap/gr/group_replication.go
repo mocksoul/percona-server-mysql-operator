@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/util/retry"
 
 	apiv1 "github.com/percona/percona-server-mysql-operator/api/v1"
+	"github.com/percona/percona-server-mysql-operator/cmd/bootstrap/recovery"
 	"github.com/percona/percona-server-mysql-operator/cmd/bootstrap/utils"
 	database "github.com/percona/percona-server-mysql-operator/cmd/internal/db"
 	"github.com/percona/percona-server-mysql-operator/pkg/innodbcluster"
@@ -655,7 +656,24 @@ func Bootstrap(ctx context.Context) error {
 	return nil
 }
 
-func getSQLRunners(primary, replica string) (primarySQLRunner *sqlRunner, replicaSQLRunner *sqlRunner, err error) {
+func getRecoveryMethod(ctx context.Context, primary, replica string) (innodbcluster.RecoveryMethod, error) {
+	primaryRunner, replicaRunner, err := getSQLRunners(primary, replica)
+	if err != nil {
+		return "", errors.Wrap(err, "get databases")
+	}
+	defer func() {
+		if err := primaryRunner.DB.Close(); err != nil {
+			log.Printf("Failed to close primary DB: %v", err)
+		}
+		if err := replicaRunner.DB.Close(); err != nil {
+			log.Printf("Failed to close local DB: %v", err)
+		}
+	}()
+
+	return recovery.Method(ctx, primaryRunner, replicaRunner)
+}
+
+func getSQLRunners(primary, replica string) (primaryRunner *recovery.Runner, replicaRunner *recovery.Runner, err error) {
 	operatorPass, err := utils.GetSecret(apiv1.UserOperator)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "get %s password", apiv1.UserOperator)
@@ -680,5 +698,5 @@ func getSQLRunners(primary, replica string) (primarySQLRunner *sqlRunner, replic
 		return nil, nil, errors.Wrap(err, "open local DB")
 	}
 
-	return &sqlRunner{db: primaryDB}, &sqlRunner{db: localDB}, nil
+	return &recovery.Runner{DB: primaryDB}, &recovery.Runner{DB: localDB}, nil
 }
