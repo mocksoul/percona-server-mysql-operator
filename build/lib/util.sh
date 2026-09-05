@@ -24,6 +24,50 @@ mysql_version() {
 	echo "${MYSQL_VERSION}"
 }
 
+# The address mysqld binds admin-address to, i.e. the one other pods use to
+# reach the admin port: clone donors, haproxy healthchecks, mysqlsh.
+#
+# `hostname -I` lists every address the pod has, in interface order, and the
+# first one is not always routable from other pods:
+#
+#   - some CNI plugins put a link-local 169.254.0.0/16 address first (the AWS
+#     VPC CNI's IPv6-cluster egress-NAT helper uses 169.254.172.0/22);
+#   - a pod with several networks (Multus, a second CNI) can have its
+#     cluster-routable address on any interface, not the first.
+#
+# POD_IP_EXCLUDE_REGEX drops addresses that must never be used (grep -E,
+# default: the whole link-local range). POD_IP_INCLUDE_REGEX, when set, then
+# picks the first address that matches it; that is how a multi-network pod
+# says which of its networks carries cluster traffic. Both regexes are
+# anchored by the caller if needed; addresses are matched one per line.
+#
+# Falls back to the unfiltered first address when nothing survives, so a host
+# with nothing but excluded addresses does not leave admin-address empty. The
+# `|| true` keeps `set -eo pipefail` from turning a no-match grep into an exit.
+pod_ip() {
+	local exclude="${POD_IP_EXCLUDE_REGEX:-^169\.254\.}"
+	local candidates ip
+
+	candidates=$(hostname -I | tr ' ' '\n' | grep -v -E "${exclude}" || true)
+
+	if [ -n "${POD_IP_INCLUDE_REGEX}" ]; then
+		ip=$(echo "${candidates}" | grep -E "${POD_IP_INCLUDE_REGEX}" | head -n1 || true)
+		if [ -z "${ip}" ]; then
+			log "no address matches POD_IP_INCLUDE_REGEX='${POD_IP_INCLUDE_REGEX}', ignoring it"
+		fi
+	fi
+
+	if [ -z "${ip}" ]; then
+		ip=$(echo "${candidates}" | head -n1)
+	fi
+
+	if [ -z "${ip}" ]; then
+		ip=$(hostname -I | awk '{print $1}')
+	fi
+
+	echo "${ip}"
+}
+
 mysql_exec() {
 	mysql -uoperator -p"$(<"${OPERATOR_PASS_FILE}")" -N -e "$1"
 }

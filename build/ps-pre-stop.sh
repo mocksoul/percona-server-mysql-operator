@@ -6,11 +6,16 @@ if [ "${CLUSTER_TYPE}" == "async" ]; then
 	exit 0
 fi
 
+LIB_PATH='/opt/percona/lib'
+# shellcheck source=build/lib/util.sh
+. ${LIB_PATH}/util.sh
+
 LOG_FILE=/var/lib/mysql/pre-stop.log
 NAMESPACE=$(</var/run/secrets/kubernetes.io/serviceaccount/namespace)
 OPERATOR_PASSWORD=$(</etc/mysql/mysql-users-secret/operator)
 FQDN="${HOSTNAME}.${SERVICE_NAME}.${NAMESPACE}"
-POD_IP=$(hostname -I | awk '{print $1}')
+# Same address mysqld bound its admin port to in ps-entrypoint.sh.
+POD_IP=$(pod_ip)
 SERVER_NUM="${HOSTNAME##*-}"
 
 if [[ ${SERVER_NUM} == "0" ]]; then
