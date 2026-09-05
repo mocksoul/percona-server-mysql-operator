@@ -35,6 +35,17 @@ const (
 	BackupLogDir          = "/var/log/xtrabackup"
 	vaultSecretVolumeName = "vault-keyring-secret"
 	vaultSecretMountPath  = "/etc/mysql/vault-keyring-secret"
+
+	// A hostPath shared by every container that talks to this mysqld over a
+	// unix socket: sidecars in the pod and workloads on the same node that
+	// are pinned there for exactly this purpose. mysqld is pointed at it by
+	// `socket=/mysql-shared/mysql.sock` in spec.mysql.configuration; the
+	// operator only makes the directory exist, owned by mysql, in every
+	// container that needs it. Per-cluster path so two clusters on one node
+	// never share a socket.
+	SharedVolumeName = "mysql-shared"
+	SharedMountPath  = "/mysql-shared"
+	SharedPathPrefix = "/run/percona-server-db"
 )
 
 const (
@@ -156,6 +167,17 @@ func StatefulSet(cr *apiv1.PerconaServerMySQL, initImage, configHash, tlsHash st
 		annotations[string(naming.AnnotationTLSHash)] = tlsHash
 	}
 
+	initContainer := k8s.InitContainer(
+		cr,
+		AppName,
+		initImage,
+		spec.InitContainer,
+		spec.ImagePullPolicy,
+		sharedDirInitSecurityContext(spec.ContainerSecurityContext),
+		spec.Resources,
+		[]corev1.VolumeMount{sharedVolumeMount()},
+	)
+
 	sts := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "apps/v1",
@@ -181,19 +203,8 @@ func StatefulSet(cr *apiv1.PerconaServerMySQL, initImage, configHash, tlsHash st
 				},
 				Spec: spec.Core(
 					selector,
-					append(volumes(cr), spec.SidecarVolumes...),
-					[]corev1.Container{
-						k8s.InitContainer(
-							cr,
-							AppName,
-							initImage,
-							spec.InitContainer,
-							spec.ImagePullPolicy,
-							spec.ContainerSecurityContext,
-							spec.Resources,
-							nil,
-						),
-					},
+					append(append(volumes(cr), sharedVolume(cr)), spec.SidecarVolumes...),
+					[]corev1.Container{initContainer},
 					containers(cr, secret),
 				),
 			},
@@ -224,6 +235,40 @@ func StatefulSet(cr *apiv1.PerconaServerMySQL, initImage, configHash, tlsHash st
 	}
 
 	return sts
+}
+
+func sharedVolume(cr *apiv1.PerconaServerMySQL) corev1.Volume {
+	dirOrCreate := corev1.HostPathDirectoryOrCreate
+	return corev1.Volume{
+		Name: SharedVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{
+				Path: SharedPathPrefix + "/" + cr.Namespace + "/" + Name(cr),
+				Type: &dirOrCreate,
+			},
+		},
+	}
+}
+
+func sharedVolumeMount() corev1.VolumeMount {
+	return corev1.VolumeMount{
+		Name:      SharedVolumeName,
+		MountPath: SharedMountPath,
+	}
+}
+
+// sharedDirInitSecurityContext is the init container's context with root
+// added: the kubelet creates the hostPath directory as root:root 0755, and
+// ps-init-entrypoint.sh has to chown it to mysql before mysqld can bind a
+// socket there. Everything else from the configured context is kept.
+func sharedDirInitSecurityContext(base *corev1.SecurityContext) *corev1.SecurityContext {
+	secCtx := &corev1.SecurityContext{}
+	if base != nil {
+		secCtx = base.DeepCopy()
+	}
+	secCtx.RunAsUser = ptr.To(int64(0))
+	secCtx.RunAsNonRoot = ptr.To(false)
+	return secCtx
 }
 
 func volumes(cr *apiv1.PerconaServerMySQL) []corev1.Volume {
@@ -649,6 +694,7 @@ func mysqldVolumeMounts(cr *apiv1.PerconaServerMySQL) []corev1.VolumeMount {
 			Name:      configVolumeName,
 			MountPath: configMountPath,
 		},
+		sharedVolumeMount(),
 	}
 
 	if cr.CompareVersion("0.11.0") >= 0 {
@@ -887,6 +933,7 @@ func heartbeatContainer(cr *apiv1.PerconaServerMySQL) corev1.Container {
 				Name:      credsVolumeName,
 				MountPath: naming.CredsMountPath,
 			},
+			sharedVolumeMount(),
 		},
 		Command:                  []string{"/opt/percona/heartbeat-entrypoint.sh"},
 		TerminationMessagePath:   "/dev/termination-log",

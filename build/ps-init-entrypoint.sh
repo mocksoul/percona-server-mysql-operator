@@ -44,3 +44,11 @@ install -o "$(id -u)" -g "$(id -g)" -m 0755 -D "${OPERATORDIR}/pmm-prerun.sh" "$
 install -o "$(id -u)" -g "$(id -g)" -m 0755 -D "${OPERATORDIR}/binlog-server-entrypoint.sh" "${BINDIR}/binlog-server-entrypoint.sh"
 install -o "$(id -u)" -g "$(id -g)" -m 0755 -D "${OPERATORDIR}/pitr" "${BINDIR}/pitr"
 install -o "$(id -u)" -g "$(id -g)" -m 0755 -D "${OPERATORDIR}/run-pitr-restore.sh" "${BINDIR}/run-pitr-restore.sh"
+
+# The socket directory shared with sidecars and same-node workloads. The
+# kubelet creates the hostPath root:root; mysqld (uid 1001) has to own it to
+# bind there. This init runs as root for exactly this line.
+if [[ -d /mysql-shared ]]; then
+	chown 1001:1001 /mysql-shared
+	chmod 0755 /mysql-shared
+fi

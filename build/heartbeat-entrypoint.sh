@@ -10,7 +10,21 @@ handle_shutdown() {
 trap handle_shutdown SIGTERM SIGINT
 
 DATA_DIR='/var/lib/mysql'
-until [ ! -f "$DATA_DIR/bootstrap.lock" ] && [ ! -f "$DATA_DIR/clone.lock" ] && [ -S "$DATA_DIR/mysql.sock" ]; do
+
+# mysqld's socket is wherever `socket=` in my.cnf put it. With the shared
+# hostPath in use that is /mysql-shared/mysql.sock; the datadir one is the
+# default. Waiting only on the datadir socket would wait forever here.
+mysql_socket() {
+	for s in /mysql-shared/mysql.sock "$DATA_DIR/mysql.sock"; do
+		if [ -S "$s" ]; then
+			echo "$s"
+			return
+		fi
+	done
+}
+
+SOCKET=""
+until [ ! -f "$DATA_DIR/bootstrap.lock" ] && [ ! -f "$DATA_DIR/clone.lock" ] && SOCKET=$(mysql_socket) && [ -n "$SOCKET" ]; do
 	if [ "$shutdown_requested" -eq 1 ]; then
 		exit 0
 	fi
@@ -32,7 +46,7 @@ MYSQL_ADMIN_PORT='33062'
 MYSQL_USER="${MYSQL_USERNAME:-monitor}"
 MYSQL_PASSWORD=$(cat /etc/mysql/mysql-users-secret/monitor || :)
 TIMEOUT="${CLONE_TIMEOUT_SECONDS:-3600}"
-MYSQL_CMDLINE="/usr/bin/timeout 10 /usr/bin/mysql -nNE -u$MYSQL_USER"
+MYSQL_CMDLINE="/usr/bin/timeout 10 /usr/bin/mysql -nNE -u$MYSQL_USER -S$SOCKET"
 
 # Check clone status every 5 seconds up to TIMEOUT
 CHECK_INTERVAL=5
@@ -67,7 +81,7 @@ ESCAPED_HEARTBEAT_PASSWORD="${HEARTBEAT_PASSWORD//,/\\,}"
 
 HEARTBEAT_USER='heartbeat'
 echo "[INFO] pt-heartbeat --update --replace --fail-successive-errors 20 --check-read-only --create-table --database sys_operator \
-	--table heartbeat --user ${HEARTBEAT_USER} --password XXXX --port ${MYSQL_ADMIN_PORT}"
+	--table heartbeat --user ${HEARTBEAT_USER} --password XXXX --socket ${SOCKET} --port ${MYSQL_ADMIN_PORT}"
 
 exec pt-heartbeat \
 	--update \
@@ -79,4 +93,5 @@ exec pt-heartbeat \
 	--table heartbeat \
 	--user "${HEARTBEAT_USER}" \
 	--password "${ESCAPED_HEARTBEAT_PASSWORD}" \
+	--socket "${SOCKET}" \
 	--port "${MYSQL_ADMIN_PORT}"

@@ -183,6 +183,64 @@ func TestStatefulSet(t *testing.T) {
 			Value: "false",
 		})
 	})
+
+	// The shared socket directory: a per-cluster hostPath, mounted in every
+	// container that talks to mysqld over the socket, made writable for
+	// mysql by the init container running as root.
+	t.Run("shared socket dir", func(t *testing.T) {
+		cluster := cr.DeepCopy()
+		cluster.Spec.MySQL.ClusterType = apiv1.ClusterTypeAsync // pt-heartbeat exists only here
+		cluster.Spec.MySQL.ContainerSecurityContext = &corev1.SecurityContext{
+			ReadOnlyRootFilesystem: ptr.To(true),
+		}
+		sts := StatefulSet(cluster, initImage, configHash, tlsHash, secret)
+		pod := sts.Spec.Template.Spec
+
+		var vol *corev1.Volume
+		for i := range pod.Volumes {
+			if pod.Volumes[i].Name == SharedVolumeName {
+				vol = &pod.Volumes[i]
+			}
+		}
+		if !assert.NotNil(t, vol, "volume %s", SharedVolumeName) || !assert.NotNil(t, vol.HostPath) {
+			t.FailNow()
+		}
+		// The path names the StatefulSet, not the cluster: consumers outside the
+		// operator mount it by that name, and namespace plus name keep two
+		// clusters on one node apart.
+		assert.Equal(t, "/run/percona-server-db/mysql-ns/cluster-mysql", vol.HostPath.Path)
+		assert.Equal(t, corev1.HostPathDirectoryOrCreate, *vol.HostPath.Type)
+
+		mounted := func(c corev1.Container) bool {
+			for _, m := range c.VolumeMounts {
+				if m.Name == SharedVolumeName && m.MountPath == SharedMountPath {
+					return true
+				}
+			}
+			return false
+		}
+		byName := map[string]corev1.Container{}
+		for _, c := range append(pod.InitContainers, pod.Containers...) {
+			byName[c.Name] = c
+		}
+		for _, name := range []string{"mysql-init", "mysql", "pt-heartbeat"} {
+			c, ok := byName[name]
+			if !assert.True(t, ok, "container %s", name) {
+				continue
+			}
+			assert.True(t, mounted(c), "%s mounts %s", name, SharedMountPath)
+		}
+
+		init := byName["mysql-init"]
+		if assert.NotNil(t, init.SecurityContext) {
+			assert.Equal(t, int64(0), *init.SecurityContext.RunAsUser, "init chowns the hostPath, needs root")
+			assert.False(t, *init.SecurityContext.RunAsNonRoot)
+			assert.True(t, *init.SecurityContext.ReadOnlyRootFilesystem, "the configured context is kept, root is added to it")
+		}
+		if assert.NotNil(t, byName["mysql"].SecurityContext) {
+			assert.Nil(t, byName["mysql"].SecurityContext.RunAsUser, "only init gets root")
+		}
+	})
 }
 
 func TestStatefulsetVolumes(t *testing.T) {
@@ -524,6 +582,15 @@ func expectedVolumes() []corev1.Volume {
 				Secret: &corev1.SecretVolumeSource{
 					SecretName: "internal-encryption-keys-ps-cluster1",
 					Optional:   ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "mysql-shared",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/run/percona-server-db/test-ns/ps-cluster1-mysql",
+					Type: ptr.To(corev1.HostPathDirectoryOrCreate),
 				},
 			},
 		},
