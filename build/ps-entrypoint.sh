@@ -176,8 +176,11 @@ create_default_cnf() {
 	if [[ ${HOSTNAME} =~ "-xb-" ]]; then
 		FQDN=${HOSTNAME}
 	else
-		CLUSTER_NAME="$(hostname -f | cut -d'.' -f2)"
-		SERVER_NUM=${HOSTNAME/$CLUSTER_NAME-/}
+		# The statefulset ordinal is the last dash-separated part of the pod
+		# name; it does not depend on `hostname -f`, which needs the headless
+		# service record to exist already and yields a wrong prefix otherwise
+		# (server_id then ends up as CLUSTER_HASH + the whole pod name).
+		SERVER_NUM="${HOSTNAME##*-}"
 		SERVER_ID=${CLUSTER_HASH}${SERVER_NUM}
 		FQDN="${HOSTNAME}.${SERVICE_NAME}.$(</var/run/secrets/kubernetes.io/serviceaccount/namespace)"
 	fi
