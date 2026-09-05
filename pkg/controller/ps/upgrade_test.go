@@ -15,7 +15,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	apiv1 "github.com/percona/percona-server-mysql-operator/api/v1"
 	"github.com/percona/percona-server-mysql-operator/pkg/mysql"
@@ -259,6 +261,119 @@ func TestSwitchOverGR(t *testing.T) {
 		err := r.switchOverGR(context.Background(), cr, primary, target)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "set primary instance")
+	})
+}
+
+// The orchestrator's primary can be a pod the operator does not manage: a
+// hand-made StatefulSet joined to the same cluster while migrating onto the
+// operator. Its name still ends in an ordinal, so without a guard smartUpdate
+// would resolve it to *our* pod with that ordinal (a replica), "switch over"
+// from it, and delete it as the primary. With an external primary the
+// operator rolls only its own pods and never asks for a switchover.
+func TestSmartUpdateExternalPrimary(t *testing.T) {
+	cr := readDefaultCRForUpgrade("test-cluster", "test-ns")
+	cr.Spec.MySQL.ClusterType = apiv1.ClusterTypeAsync
+	cr.Spec.MySQL.Size = 2
+	s := newScheme(t)
+
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: mysql.Name(cr), Namespace: cr.Namespace},
+		Spec: appsv1.StatefulSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "mysql"}},
+		},
+		Status: appsv1.StatefulSetStatus{Replicas: 2, ReadyReplicas: 2, UpdateRevision: "rev-2"},
+	}
+	readyPod := func(i int, revision string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      mysql.PodName(cr, i),
+				Namespace: cr.Namespace,
+				Labels:    map[string]string{"app": "mysql", controllerRevisionHash: revision},
+			},
+			Status: corev1.PodStatus{
+				Phase:      corev1.PodRunning,
+				Conditions: []corev1.PodCondition{{Type: corev1.ContainersReady, Status: corev1.ConditionTrue}},
+			},
+		}
+	}
+	orcPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: orchestrator.PodName(cr, 0), Namespace: cr.Namespace, Labels: orchestrator.MatchLabels(cr)},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.ContainersReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	// "test-cluster-mysql-master-0" parses to ordinal 0 == our pod 0. That
+	// collision is the whole point of the test.
+	externalPrimary, _ := json.Marshal(orchestrator.Instance{
+		Key:   orchestrator.InstanceKey{Hostname: mysql.Name(cr) + "-master-0." + mysql.Name(cr) + "-master." + cr.Namespace},
+		Alias: mysql.Name(cr) + "-master-0",
+	})
+	primaryQuery := []string{"sh", "-c", fmt.Sprintf(`curl -s -u "%s:$(cat %s/%s)" "localhost:3000/api/master/%s"`, apiv1.UserOrchestrator, orchestrator.CredsMountPath, apiv1.UserOrchestrator, cr.ClusterHint())}
+
+	t.Run("outdated replica is rolled, no switchover", func(t *testing.T) {
+		pod0, pod1 := readyPod(0, "rev-2"), readyPod(1, "rev-1")
+		// Stand in for the StatefulSet controller: a deleted pod comes back
+		// on the new revision, ready, so deletePodAndWait returns at once.
+		var deleted []string
+		recreate := interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+				deleted = append(deleted, obj.GetName())
+				pod := obj.(*corev1.Pod)
+				pod.Labels[controllerRevisionHash] = sts.Status.UpdateRevision
+				return c.Update(ctx, pod)
+			},
+		}
+		cli := fake.NewClientBuilder().WithScheme(s).WithObjects(sts, pod0, pod1, orcPod).WithInterceptorFuncs(recreate).Build()
+		fc := &fakeClient{scripts: []fakeClientScript{{cmd: primaryQuery, stdout: externalPrimary}}}
+		r := &PerconaServerMySQLReconciler{Client: cli, Scheme: s, ClientCmd: fc, Recorder: new(record.FakeRecorder)}
+
+		require.NoError(t, r.smartUpdate(t.Context(), sts, cr))
+
+		assert.Equal(t, 1, fc.execCount, "only the primary lookup; no graceful-master-takeover")
+		assert.Equal(t, []string{pod1.Name}, deleted, "the outdated replica, not pod 0 whose ordinal matches the external primary")
+	})
+
+	// This is the pass where the ordinal collision bites: every other pod is
+	// current, pod 0 is not. Treating pod 0 as the primary means a
+	// graceful-master-takeover request to the orchestrator for a primary that
+	// is not even in this StatefulSet.
+	t.Run("pod 0 outdated, other replicas current", func(t *testing.T) {
+		pod0, pod1 := readyPod(0, "rev-1"), readyPod(1, "rev-2")
+		var deleted []string
+		recreate := interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+				deleted = append(deleted, obj.GetName())
+				pod := obj.(*corev1.Pod)
+				pod.Labels[controllerRevisionHash] = sts.Status.UpdateRevision
+				return c.Update(ctx, pod)
+			},
+		}
+		cli := fake.NewClientBuilder().WithScheme(s).WithObjects(sts, pod0, pod1, orcPod).WithInterceptorFuncs(recreate).Build()
+		fc := &fakeClient{scripts: []fakeClientScript{{cmd: primaryQuery, stdout: externalPrimary}}}
+		r := &PerconaServerMySQLReconciler{Client: cli, Scheme: s, ClientCmd: fc, Recorder: new(record.FakeRecorder)}
+
+		require.NoError(t, r.smartUpdate(t.Context(), sts, cr))
+
+		assert.Equal(t, 1, fc.execCount, "only the primary lookup; no graceful-master-takeover")
+		assert.Equal(t, []string{pod0.Name}, deleted, "pod 0 is rolled like any replica")
+	})
+
+	t.Run("all replicas current: nothing to do", func(t *testing.T) {
+		pod0, pod1 := readyPod(0, "rev-2"), readyPod(1, "rev-2")
+		var deleted []string
+		track := interceptor.Funcs{
+			Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+				deleted = append(deleted, obj.GetName())
+				return nil
+			},
+		}
+		cli := fake.NewClientBuilder().WithScheme(s).WithObjects(sts, pod0, pod1, orcPod).WithInterceptorFuncs(track).Build()
+		fc := &fakeClient{scripts: []fakeClientScript{{cmd: primaryQuery, stdout: externalPrimary}}}
+		r := &PerconaServerMySQLReconciler{Client: cli, Scheme: s, ClientCmd: fc, Recorder: new(record.FakeRecorder)}
+
+		require.NoError(t, r.smartUpdate(t.Context(), sts, cr))
+		assert.Empty(t, deleted)
 	})
 }
 

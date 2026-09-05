@@ -80,6 +80,19 @@ func (r *PerconaServerMySQLReconciler) smartUpdate(ctx context.Context, sts *app
 	if err != nil {
 		return err
 	}
+
+	// The primary may live outside this StatefulSet: a hand-managed sts in
+	// the same orchestrator cluster during a migration. Its name still parses
+	// to an ordinal and mysql.GetPod would happily return *our* pod with that
+	// ordinal -- a replica -- and the switchover below would demote nothing
+	// and then delete it as if it were the primary. Rolling replicas is safe
+	// with an external primary; touching the primary is not ours to do.
+	if !podInList(primaryHost, pods.Items) {
+		log.Info("primary is not one of this StatefulSet's pods, updating secondaries only", "primary", primaryHost)
+		_, err := rollOneOutdated(ctx, r.Client, pods.Items, sts, currentSet)
+		return err
+	}
+
 	idx, err := getPodIndexFromHostname(primaryHost)
 	if err != nil {
 		return err
@@ -94,17 +107,9 @@ func (r *PerconaServerMySQLReconciler) smartUpdate(ctx context.Context, sts *app
 		return p.Name == primPod.Name
 	})
 
-	for _, pod := range secondaries {
-		pod := pod
-
-		log.Info("apply changes to the secondary pod", "pod", pod.Name)
-
-		if pod.Labels[controllerRevisionHash] == sts.Status.UpdateRevision {
-			log.Info("pod updated", "pod", pod.Name)
-			continue
-		}
-
-		return deletePodAndWait(ctx, r.Client, &pod, currentSet)
+	// One pod per reconcile; the next pass picks up the next outdated one.
+	if rolled, err := rollOneOutdated(ctx, r.Client, secondaries, sts, currentSet); rolled || err != nil {
+		return err
 	}
 
 	target, err := selectPrimaryCandidate(secondaries)
@@ -129,6 +134,38 @@ func (r *PerconaServerMySQLReconciler) smartUpdate(ctx context.Context, sts *app
 	log.Info("primary pod updated", "pod", primPod.Name)
 	log.Info("smart update finished")
 	return nil
+}
+
+// podInList reports whether host (a pod name or FQDN) is one of pods.
+func podInList(host string, pods []corev1.Pod) bool {
+	name, _, _ := strings.Cut(host, ".")
+	for i := range pods {
+		if pods[i].Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// firstOutdated returns the first pod not yet on the sts update revision.
+func firstOutdated(pods []corev1.Pod, sts *appsv1.StatefulSet) *corev1.Pod {
+	for i := range pods {
+		if pods[i].Labels[controllerRevisionHash] != sts.Status.UpdateRevision {
+			return &pods[i]
+		}
+	}
+	return nil
+}
+
+// rollOneOutdated deletes the first outdated pod and waits for it to come
+// back ready. Returns whether there was one.
+func rollOneOutdated(ctx context.Context, cli client.Client, pods []corev1.Pod, sts, currentSet *appsv1.StatefulSet) (bool, error) {
+	pod := firstOutdated(pods, sts)
+	if pod == nil {
+		return false, nil
+	}
+	logf.FromContext(ctx).Info("apply changes to the secondary pod", "pod", pod.Name)
+	return true, deletePodAndWait(ctx, cli, pod, currentSet)
 }
 
 func stsChanged(sts *appsv1.StatefulSet, pods []corev1.Pod) bool {
