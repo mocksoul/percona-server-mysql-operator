@@ -388,10 +388,31 @@ func TestValidateUserSecret(t *testing.T) {
 			wantError: "missing password for monitor user",
 		},
 		{
-			name:        "unknown user",
+			// The secret is shared with hand-maintained application accounts.
+			// They must not make the whole secret invalid -- that would leave
+			// the system passwords unreconciled.
+			name:        "user the operator does not manage",
 			clusterType: apiv1.ClusterTypeGR,
-			secret:      s(apiv1.ClusterTypeGR, apiv1.SystemUser("unknown"), []byte("password")),
-			wantError:   "unknown user unknown is specified in the secret",
+			secret:      s(apiv1.ClusterTypeGR, apiv1.SystemUser("rtapi"), []byte("password")),
+		},
+		{
+			// A foreign key must not mask a real problem either.
+			name:        "foreign user alongside a broken system password",
+			clusterType: apiv1.ClusterTypeGR,
+			secret: func() *corev1.Secret {
+				secret := s(apiv1.ClusterTypeGR, apiv1.SystemUser("rtapi"), []byte("password"))
+				secret.Data[string(apiv1.UserRoot)] = nil
+				return secret
+			}(),
+			wantError: "password is empty for root user",
+		},
+		{
+			// Length limits apply to system users only: a foreign password of
+			// any size is not the operator's to police.
+			name:        "foreign user with an over-long password",
+			clusterType: apiv1.ClusterTypeGR,
+			secret: s(apiv1.ClusterTypeGR, apiv1.SystemUser("rtapi"),
+				bytes.Repeat([]byte{'a'}, mySQLPasswordMaxLength+1)),
 		},
 		{
 			name:        "empty password",
@@ -598,6 +619,114 @@ func TestReconcileUsersCreatesClusterSetUser(t *testing.T) {
 	if fc.execCount != len(scripts) {
 		t.Fatalf("expected %d exec calls, got %d", len(scripts), fc.execCount)
 	}
+}
+
+// Application accounts share the users secret with the operator's own. Their
+// passwords are maintained by hand; the operator must leave them alone. The
+// lookup that turns a secret key into a MySQL user yields an empty username for
+// them, so acting on one would mean ALTER USER ”@” -- or, with the upstream
+// validator, refusing the secret and reconciling no passwords at all.
+func TestReconcileUsersIgnoresForeignUsers(t *testing.T) {
+	ctx := context.Background()
+
+	const crName = "shared-secret-cluster"
+	const ns = "some-namespace"
+	const operatorPass = "op-password"
+
+	cr := &apiv1.PerconaServerMySQL{
+		ObjectMeta: metav1.ObjectMeta{Name: crName, Namespace: ns},
+		Spec: apiv1.PerconaServerMySQLSpec{
+			CRVersion:   "1.2.0",
+			SecretsName: "some-secret",
+			MySQL:       apiv1.MySQLSpec{ClusterType: apiv1.ClusterTypeGR},
+		},
+		Status: apiv1.PerconaServerMySQLStatus{
+			MySQL: apiv1.StatefulAppStatus{State: apiv1.StateReady},
+			State: apiv1.StateInitializing,
+		},
+	}
+
+	systemData := map[string][]byte{
+		string(apiv1.UserHeartbeat):    []byte("hb-password"),
+		string(apiv1.UserMonitor):      []byte("m-password"),
+		string(apiv1.UserOperator):     []byte(operatorPass),
+		string(apiv1.UserOrchestrator): []byte("orc-password"),
+		string(apiv1.UserReplication):  []byte("repl-password"),
+		string(apiv1.UserRoot):         []byte("root-password"),
+		string(apiv1.UserXtraBackup):   []byte("backup-password"),
+		string(apiv1.UserClusterSet):   []byte("cs-password"),
+	}
+
+	// Every system password is already applied; only the foreign one differs,
+	// so anything the operator executes here is something it should not have.
+	oldData := make(map[string][]byte, len(systemData)+1)
+	maps.Copy(oldData, systemData)
+	oldData["rtapi"] = []byte("rtapi-password-old")
+
+	newData := make(map[string][]byte, len(systemData)+1)
+	maps.Copy(newData, systemData)
+	newData["rtapi"] = []byte("rtapi-password-new")
+
+	userSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: cr.Spec.SecretsName, Namespace: ns},
+		Data:       newData,
+	}
+	internalSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: cr.InternalSecretName(), Namespace: ns},
+		Data:       oldData,
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mysql.PodName(cr, 0),
+			Namespace: ns,
+			Labels:    mysql.MatchLabels(cr),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme), "failed to add client-go scheme")
+	require.NoError(t, apiv1.AddToScheme(scheme), "failed to add apis scheme")
+
+	host := mysql.FQDN(cr, 0)
+	mysqlCmd := func(query string) []string {
+		return []string{
+			"mysql",
+			"--database", "performance_schema",
+			"-p" + operatorPass,
+			"-u", "operator",
+			"-h", host,
+			"-e", query,
+		}
+	}
+
+	// Finding the primary, then the FLUSH PRIVILEGES that closes every pass.
+	// What must not appear between them is an ALTER USER.
+	scripts := []fakeClientScript{
+		{
+			cmd:    mysqlCmd("SELECT MEMBER_HOST as host FROM replication_group_members WHERE MEMBER_ROLE='PRIMARY' AND MEMBER_STATE='ONLINE'"),
+			stdout: []byte("host\n" + host + "\n"),
+		},
+		{
+			cmd: mysqlCmd("FLUSH PRIVILEGES"),
+		},
+	}
+	fc := &fakeClient{scripts: scripts}
+
+	r := PerconaServerMySQLReconciler{
+		Client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(cr, userSecret, internalSecret, pod).Build(),
+		Scheme:    scheme,
+		ClientCmd: fc,
+	}
+
+	require.NoError(t, r.reconcileUsers(ctx, cr, userSecret), "reconcileUsers failed")
+	assert.Equal(t, len(scripts), fc.execCount, "operator touched MySQL for a user it does not manage")
 }
 
 func TestReconcileUsersRestartsRouterOnOperatorPasswordUpdate(t *testing.T) {

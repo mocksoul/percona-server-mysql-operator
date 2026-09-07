@@ -275,7 +275,14 @@ func (r *PerconaServerMySQLReconciler) reconcileUsers(ctx context.Context, cr *a
 			continue
 		}
 
-		mysqlUser := allUsers[apiv1.SystemUser(user)]
+		mysqlUser, ok := allUsers[apiv1.SystemUser(user)]
+		if !ok {
+			// Not one of ours -- an application account sharing the secret.
+			// Its password is maintained by hand; touching it here would build
+			// an ALTER USER for the empty username this lookup yields.
+			log.V(1).Info("Skipping user the operator does not manage", "user", user)
+			continue
+		}
 		mysqlUser.Password = string(pass)
 
 		switch apiv1.SystemUser(user) {
@@ -451,8 +458,11 @@ func validateUserSecret(cr *apiv1.PerconaServerMySQL, secret *corev1.Secret) err
 	}
 
 	for user, pass := range secret.Data {
-		if _, ok := systemUsers[apiv1.SystemUser(user)]; !ok && user != string(apiv1.UserPMMServerToken) {
-			errs = append(errs, fmt.Errorf("unknown user %s is specified in the secret", string(user)))
+		if _, ok := systemUsers[apiv1.SystemUser(user)]; !ok {
+			// The secret is shared with users the operator knows nothing about --
+			// application accounts, maintained by hand outside the cluster. They
+			// are none of its business: skip them rather than refuse the whole
+			// secret and leave the system passwords unreconciled.
 			continue
 		}
 		if user == string(apiv1.UserPMMServerToken) {
