@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -120,4 +122,25 @@ func TestConfigMapDataUserConfiguration(t *testing.T) {
 		assert.EqualValues(t, "evil", cfg["HostnameResolveMethod"])
 		assert.EqualValues(t, false, cfg["UseSuperReadOnly"])
 	})
+}
+
+// pt-heartbeat stamps ts from the clock of the container it runs in, not from
+// the server: `$sth->execute(ts(time, $utc), ...)`. That container is UTC,
+// while mysqld here runs at +03:00, so NOW() and ts sit on different scales and
+// every replica reports a constant 3h lag. FailMasterPromotionOnLagMinutes then
+// refuses every switchover, including the ones smart update needs.
+func TestBakedReplicationLagQueryIsTimezoneAgnostic(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "build", "orchestrator.conf.json"))
+	require.NoError(t, err)
+
+	cfg := map[string]interface{}{}
+	require.NoError(t, json.Unmarshal(raw, &cfg))
+
+	query, ok := cfg["ReplicationLagQuery"].(string)
+	require.True(t, ok, "ReplicationLagQuery must be baked into the config")
+
+	assert.NotContains(t, query, "NOW()",
+		"NOW() follows the server timezone; ts is written in UTC by pt-heartbeat")
+	assert.Contains(t, query, "UTC_TIMESTAMP()",
+		"both sides of the subtraction must be UTC")
 }
